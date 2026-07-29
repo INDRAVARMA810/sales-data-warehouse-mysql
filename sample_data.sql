@@ -7,10 +7,17 @@
 --   Run with:
 --       mysql --user=root --password --show-warnings < sample_data.sql
 --
---   Runtime is a few seconds. Every statement is SET-BASED — there is not a
---   single loop, cursor, or row-by-row INSERT in this file. Generating 50,000
---   rows with a WHILE loop is the classic way to turn a 3-second job into a
---   3-minute one, and it teaches exactly the wrong instinct.
+--   Runtime is well under a minute. Every statement is SET-BASED — there is
+--   not a single loop, cursor, or row-by-row INSERT in this file. Generating
+--   50,000 rows with a WHILE loop is the classic way to turn a 3-second job
+--   into a 3-minute one, and it teaches exactly the wrong instinct.
+--
+--   Sections 10-12 (the three high-volume generators: orders, order lines,
+--   inventory) run as many small INSERT ... SELECT statements instead of one
+--   large one each, specifically so no single statement runs long enough to
+--   trip a client-side query timeout in MySQL Workbench. See Section 10's
+--   header for the full rationale — this is still all set-based; "many small
+--   statements" is a different thing from "row-by-row".
 --
 -- -----------------------------------------------------------------------------
 -- WHAT THIS FILE DOES, AND THE ONE THING IT DELIBERATELY DOES NOT
@@ -894,31 +901,69 @@ CREATE TEMPORARY TABLE tmp_order (
     PRIMARY KEY (order_seq)
 ) ENGINE = InnoDB;
 
+-- -----------------------------------------------------------------------------
+-- BATCHING (added after Error 2013 in MySQL Workbench 8.0)
+-- -----------------------------------------------------------------------------
+-- A previous version of this file generated all ~20,500 orders, all ~51,000
+-- order lines, and all 40,000 inventory rows each in ONE INSERT ... SELECT.
+-- The order-line statement in particular evaluates dozens of CRC32() calls per
+-- output row; on a ~51,000-row result that ran long enough for MySQL
+-- Workbench's client-side read timeout to give up mid-query and report
+-- "Error 2013: Lost connection to MySQL server during query" — even though
+-- the values themselves were never the problem.
+--
+-- THE FIX: split each of Sections 10-12 into many independent top-level
+-- INSERT statements of roughly 500-1,000 rows apiece, instead of one giant
+-- statement. Workbench (or the mysql CLI) executes a script one statement at
+-- a time, so no individual statement runs long enough to trip any timeout,
+-- even though the total amount of work is the same.
+--
+-- THIS IS NOT THE "WHILE loop" ANTI-PATTERN the file header warns against. A
+-- server-side loop was considered and rejected: wrapping the batches in a
+-- stored procedure and issuing one CALL would still be ONE statement from the
+-- client's point of view, so it would not shorten any single round-trip and
+-- would not have fixed the timeout. Each batch below is still a genuine
+-- set-based INSERT ... SELECT of several hundred rows — nothing here is
+-- row-by-row.
+--
+-- Sections 10 and 11 share the SAME 55 date-range boundaries (20 calendar
+-- days per batch; 1,096 sales-window days / 20 = 55 batches, the last one 16
+-- days) so that "batch 12 of orders" and "batch 12 of order lines" cover the
+-- identical calendar window. These boundaries are literal, tied to
+-- @sales_days = 1096 (Section 0) — if that constant ever changes, the
+-- boundaries below need regenerating to match. Section 12 batches by product
+-- number instead (50 batches of 10 products each; 500 / 10 divides evenly),
+-- since inventory rows are not date-partitioned.
+--
+-- Every batch runs the EXACT SAME CRC32(...)-seeded expressions the original
+-- single statement did, over a slice of the same rows — the WHERE-clause
+-- boundary is the only thing that differs, so the generated values are
+-- unaffected by batching. The one thing NOT guaranteed identical to a
+-- hypothetical prior successful run is the AUTO_INCREMENT order in which
+-- tmp_order.order_seq (and therefore stg_sales_order_line._source_row_num)
+-- gets assigned: that was never a documented guarantee even in the original
+-- single-statement form, since MySQL does not promise row-processing order
+-- for an INSERT ... SELECT with no ORDER BY. Nothing downstream depends on
+-- the specific value of order_seq — DEFECT #12's "first 25 rows" still picks
+-- exactly 25 real rows to duplicate, just not provably the same 25 physical
+-- rows as an unbatched run would have picked.
+-- -----------------------------------------------------------------------------
+
 INSERT INTO tmp_order (
     order_number, order_date, shipped_date, customer_id, store_id, channel_id,
     order_status, payment_method, shipping_priority, is_gift, line_count,
     promotion_id, promotion_pct
 )
 SELECT
-    -- Date-embedded order numbers are unique by construction (one sequence per
-    -- day) and readable at a glance. They are also realistic: plenty of order
-    -- management systems number this way.
     CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
     d.full_date,
-
-    -- Cancelled and not-yet-fulfilled orders have NO ship date. This is the
-    -- legitimate Not-Applicable case that must resolve to ship_date_key = 0,
-    -- and it must NOT be confused with Unknown (-1). ~12% of orders.
     CASE
         WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
         ELSE DATE_ADD(d.full_date,
                       INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
     END,
-
     CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
     CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
-
-    -- Channel mix: Web 35 / App 30 / Store 20 / Phone 8 / Partner 7.
     CASE
         WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
         WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
@@ -926,39 +971,21 @@ SELECT
         WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
         ELSE 'CH-PARTNER'
     END,
-
     st.order_status,
-
-    -- Payment mix: Credit 45 / Debit 25 / PayPal 20 / Gift Card 10.
     CASE
         WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
         WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
         WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
         ELSE 'Gift Card'
     END,
-
-    -- Priority mix: Standard 70 / Express 23 / Overnight 7.
     CASE
         WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
         WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
         ELSE 'Overnight'
     END,
-
-    -- Gift orders spike in December — a small touch, but it means the junk
-    -- dimension has a genuine seasonal signal in it rather than uniform noise.
     IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
            < IF(d.month_number = 12, 34, 9), 1, 0),
-
-    -- 1-4 lines per order, averaging 2.5 -> ~51,000 lines from ~20,500 orders.
     1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
-
-    -- The promotion active on this order's date, if any. Resolved by a
-    -- correlated subquery against the 30 real promotions already loaded in §7,
-    -- so a line can never reference a promotion that had not started yet — a
-    -- consistency error that would quietly poison every promotional-lift
-    -- calculation in Milestone 6.
-    -- LIMIT 1 because promotion windows occasionally overlap; without it the
-    -- subquery would raise ERROR 1242 on those dates.
     (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
       WHERE pr.promotion_key > 0
         AND d.full_date BETWEEN pr.start_date AND pr.end_date
@@ -967,15 +994,8 @@ SELECT
       WHERE pr.promotion_key > 0
         AND d.full_date BETWEEN pr.start_date AND pr.end_date
       ORDER BY pr.promotion_key LIMIT 1)
-
 FROM warehouse.dim_date d
--- Capped at 60 rather than joining all 10,000. The busiest possible day is
--- 15 x 1.90 x 1.35 x 1.20 = 46 orders, so 60 is a safe ceiling — and it turns a
--- 1,096 x 10,000 nested-loop scan (11M CRC32 evaluations) into 1,096 x 60.
--- The join condition is a non-equi expression, so no index can help; bounding
--- the driving set is the only lever available.
 JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
-  -- THE SEASONALITY JOIN. o.n runs 1..(orders for this specific day).
   ON  o.n <= GREATEST(1, CAST(
           15
         * CASE WHEN d.month_number IN (11, 12) THEN 1.90
@@ -985,10 +1005,6 @@ JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
         * IF(d.is_weekend = 1, 1.35, 1.00)
         * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
       AS SIGNED))
--- Status mix: Delivered 65 / Shipped 15 / Awaiting 10 / Cancelled 6 / Returned 4.
--- Joined as a derived table rather than repeated inline, because order_status is
--- needed twice (for the status column and to decide shipped_date) and MySQL
--- would otherwise evaluate the same CASE twice with no guarantee they agree.
 JOIN (
     SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
     UNION ALL SELECT 65, 80, 'Shipped'
@@ -999,8 +1015,3734 @@ JOIN (
   ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
   AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
 WHERE d.date_key > 0
-  AND d.full_date >= @sales_start
-  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL @sales_days DAY);
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 0 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 20 DAY);  -- batch 1/55 (days 0-19)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 20 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 40 DAY);  -- batch 2/55 (days 20-39)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 40 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 60 DAY);  -- batch 3/55 (days 40-59)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 60 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 80 DAY);  -- batch 4/55 (days 60-79)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 80 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 100 DAY);  -- batch 5/55 (days 80-99)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 100 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 120 DAY);  -- batch 6/55 (days 100-119)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 120 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 140 DAY);  -- batch 7/55 (days 120-139)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 140 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 160 DAY);  -- batch 8/55 (days 140-159)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 160 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 180 DAY);  -- batch 9/55 (days 160-179)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 180 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 200 DAY);  -- batch 10/55 (days 180-199)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 200 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 220 DAY);  -- batch 11/55 (days 200-219)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 220 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 240 DAY);  -- batch 12/55 (days 220-239)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 240 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 260 DAY);  -- batch 13/55 (days 240-259)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 260 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 280 DAY);  -- batch 14/55 (days 260-279)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 280 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 300 DAY);  -- batch 15/55 (days 280-299)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 300 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 320 DAY);  -- batch 16/55 (days 300-319)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 320 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 340 DAY);  -- batch 17/55 (days 320-339)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 340 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 360 DAY);  -- batch 18/55 (days 340-359)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 360 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 380 DAY);  -- batch 19/55 (days 360-379)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 380 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 400 DAY);  -- batch 20/55 (days 380-399)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 400 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 420 DAY);  -- batch 21/55 (days 400-419)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 420 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 440 DAY);  -- batch 22/55 (days 420-439)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 440 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 460 DAY);  -- batch 23/55 (days 440-459)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 460 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 480 DAY);  -- batch 24/55 (days 460-479)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 480 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 500 DAY);  -- batch 25/55 (days 480-499)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 500 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 520 DAY);  -- batch 26/55 (days 500-519)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 520 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 540 DAY);  -- batch 27/55 (days 520-539)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 540 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 560 DAY);  -- batch 28/55 (days 540-559)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 560 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 580 DAY);  -- batch 29/55 (days 560-579)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 580 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 600 DAY);  -- batch 30/55 (days 580-599)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 600 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 620 DAY);  -- batch 31/55 (days 600-619)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 620 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 640 DAY);  -- batch 32/55 (days 620-639)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 640 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 660 DAY);  -- batch 33/55 (days 640-659)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 660 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 680 DAY);  -- batch 34/55 (days 660-679)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 680 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 700 DAY);  -- batch 35/55 (days 680-699)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 700 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 720 DAY);  -- batch 36/55 (days 700-719)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 720 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 740 DAY);  -- batch 37/55 (days 720-739)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 740 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 760 DAY);  -- batch 38/55 (days 740-759)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 760 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 780 DAY);  -- batch 39/55 (days 760-779)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 780 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 800 DAY);  -- batch 40/55 (days 780-799)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 800 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 820 DAY);  -- batch 41/55 (days 800-819)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 820 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 840 DAY);  -- batch 42/55 (days 820-839)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 840 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 860 DAY);  -- batch 43/55 (days 840-859)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 860 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 880 DAY);  -- batch 44/55 (days 860-879)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 880 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 900 DAY);  -- batch 45/55 (days 880-899)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 900 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 920 DAY);  -- batch 46/55 (days 900-919)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 920 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 940 DAY);  -- batch 47/55 (days 920-939)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 940 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 960 DAY);  -- batch 48/55 (days 940-959)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 960 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 980 DAY);  -- batch 49/55 (days 960-979)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 980 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 1000 DAY);  -- batch 50/55 (days 980-999)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 1000 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 1020 DAY);  -- batch 51/55 (days 1000-1019)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 1020 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 1040 DAY);  -- batch 52/55 (days 1020-1039)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 1040 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 1060 DAY);  -- batch 53/55 (days 1040-1059)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 1060 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 1080 DAY);  -- batch 54/55 (days 1060-1079)
+
+INSERT INTO tmp_order (
+    order_number, order_date, shipped_date, customer_id, store_id, channel_id,
+    order_status, payment_method, shipping_priority, is_gift, line_count,
+    promotion_id, promotion_pct
+)
+SELECT
+    CONCAT('ORD-', d.date_key, '-', LPAD(o.n, 3, '0')) AS order_number,
+    d.full_date,
+    CASE
+        WHEN st.order_status IN ('Cancelled', 'Awaiting Fulfilment') THEN NULL
+        ELSE DATE_ADD(d.full_date,
+                      INTERVAL 1 + (CRC32(CONCAT('ship', d.date_key, o.n)) % 7) DAY)
+    END,
+    CONCAT('C-', LPAD(1 + (CRC32(CONCAT('ocust', d.date_key, o.n)) % 1000), 5, '0')),
+    CONCAT('S-', LPAD(1 + (CRC32(CONCAT('ostore', d.date_key, o.n)) % 25), 3, '0')),
+    CASE
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 35 THEN 'CH-WEB'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 65 THEN 'CH-APP'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 85 THEN 'CH-STORE'
+        WHEN CRC32(CONCAT('chan', d.date_key, o.n)) % 100 < 93 THEN 'CH-PHONE'
+        ELSE 'CH-PARTNER'
+    END,
+    st.order_status,
+    CASE
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 45 THEN 'Credit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 70 THEN 'Debit Card'
+        WHEN CRC32(CONCAT('pay', d.date_key, o.n)) % 100 < 90 THEN 'PayPal'
+        ELSE 'Gift Card'
+    END,
+    CASE
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 70 THEN 'Standard'
+        WHEN CRC32(CONCAT('prio', d.date_key, o.n)) % 100 < 93 THEN 'Express'
+        ELSE 'Overnight'
+    END,
+    IF(CRC32(CONCAT('gift', d.date_key, o.n)) % 100
+           < IF(d.month_number = 12, 34, 9), 1, 0),
+    1 + (CRC32(CONCAT('lines', d.date_key, o.n)) % 4),
+    (SELECT pr.promotion_id FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1),
+    (SELECT pr.discount_pct FROM warehouse.dim_promotion pr
+      WHERE pr.promotion_key > 0
+        AND d.full_date BETWEEN pr.start_date AND pr.end_date
+      ORDER BY pr.promotion_key LIMIT 1)
+FROM warehouse.dim_date d
+JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 1 AND 60) o
+  ON  o.n <= GREATEST(1, CAST(
+          15
+        * CASE WHEN d.month_number IN (11, 12) THEN 1.90
+               WHEN d.month_number IN ( 1,  2) THEN 0.75
+               WHEN d.month_number IN ( 6,  7) THEN 1.15
+               ELSE 1.00 END
+        * IF(d.is_weekend = 1, 1.35, 1.00)
+        * (0.80 + (CRC32(CONCAT('vol', d.date_key)) % 41) / 100.0)
+      AS SIGNED))
+JOIN (
+    SELECT 0 AS lo, 65 AS hi, 'Delivered'           AS order_status
+    UNION ALL SELECT 65, 80, 'Shipped'
+    UNION ALL SELECT 80, 90, 'Awaiting Fulfilment'
+    UNION ALL SELECT 90, 96, 'Cancelled'
+    UNION ALL SELECT 96, 100, 'Returned'
+) st
+  ON  CRC32(CONCAT('stat', d.date_key, o.n)) % 100 >= st.lo
+  AND CRC32(CONCAT('stat', d.date_key, o.n)) % 100 <  st.hi
+WHERE d.date_key > 0
+  AND d.full_date >= DATE_ADD(@sales_start, INTERVAL 1080 DAY)
+  AND d.full_date <  DATE_ADD(@sales_start, INTERVAL 1096 DAY);  -- batch 55/55 (days 1080-1095)
 
 
 -- =============================================================================
@@ -1024,6 +4766,11 @@ WHERE d.date_key > 0
 -- something when Milestone 6 aggregates it by category.
 -- =============================================================================
 
+-- BATCHING: see Section 10's header for the full rationale (Error 2013 in
+-- MySQL Workbench). This section reuses the SAME 55 date-range boundaries,
+-- applied here to o.order_date so each batch of lines lines up with the
+-- matching batch of orders.
+
 INSERT INTO staging.stg_sales_order_line (
     order_number, order_line_number, ordered_at, shipped_date,
     customer_id, store_id, channel_id, product_id, promotion_id,
@@ -1034,50 +4781,24 @@ INSERT INTO staging.stg_sales_order_line (
 SELECT
     o.order_number,
     CAST(ln.n AS CHAR),
-    -- Orders arrive with a TIMESTAMP; the warehouse keeps only the date, since
-    -- the declared grain is the order line and nothing needs time-of-day.
-    -- Staging keeps the full precision so that decision stays reversible.
     CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
            LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
            LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
-    -- Empty string, not NULL: this is a text feed, and an unshipped order shows
-    -- up as a blank field. The transform must map blank -> key 0.
     IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
-
-    -- DEFECT #10: ~50 lines reference a customer that does not exist in
-    -- stg_customer. Resolves to customer_key = -1 (Unknown) — the revenue is
-    -- preserved, and `WHERE customer_key = -1` measures the feed's failure rate.
     IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
        'C-99999', o.customer_id),
-
     o.store_id,
     o.channel_id,
-
-    -- DEFECT #9: ~200 lines reference a product not in the master feed. THE
-    -- LATE-ARRIVING DIMENSION from dimensional_modeling.md §9 — the sale is
-    -- real and its money must not be dropped, but the product is unknown at
-    -- load time. Correct handling is an inferred placeholder or product_key =
-    -- -1; the wrong handling, rejecting the row, silently deletes revenue.
     IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
        CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
        CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
-
-    -- ~45% of lines on a promoted order actually take the promotion; the rest
-    -- are blank. Blank is NOT APPLICABLE (key 0), not Unknown (key -1).
     IF(o.promotion_id IS NOT NULL
        AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
        o.promotion_id, ''),
-
     o.order_status,
     o.payment_method,
     o.shipping_priority,
     CAST(o.is_gift AS CHAR),
-
-    -- DEFECT #11: ~50 lines carry a non-numeric quantity and ~50 carry '0'.
-    -- Two distinct failures: 'N/A' is a parse error, '0' parses fine and is
-    -- still invalid — a zero-quantity sale is not a business event, which is
-    -- what ck_fact_sales_quantity (quantity <> 0) exists to catch. The second
-    -- kind is the more dangerous, because nothing about it looks wrong.
     CASE
         WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
         WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
@@ -1091,21 +4812,12 @@ SELECT
                 ELSE 6
             END AS CHAR)
     END,
-
-    -- Selling price = list price, with an occasional markdown. Storing the
-    -- ACTUAL transacted price is the point: architecture.md §5.6 requires the
-    -- fact to record what happened, not what the price list says today.
     CAST(ROUND(pr.list_price *
         CASE
             WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
             WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
             ELSE 0.90
         END, 2) AS CHAR),
-
-    -- Line discount = qty x price x the promotion's percentage. Zero when no
-    -- promotion applies. Computed here so the ETL has a real additive
-    -- discount_amount to load rather than re-deriving it from a percentage —
-    -- percentages are non-additive and must never be the stored measure.
     CAST(ROUND(
         IF(o.promotion_id IS NOT NULL
            AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
@@ -1120,9 +4832,6 @@ SELECT
                END
              * IFNULL(o.promotion_pct, 0),
            0), 2) AS CHAR),
-
-    -- Sales tax at 8.25% of the discounted line. EXCLUDED from net_sales_amount
-    -- by the schema's definition — tax is collected, not earned.
     CAST(ROUND(pr.list_price
         * CASE
               WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
@@ -1133,21 +4842,4500 @@ SELECT
               ELSE 6
           END
         * 0.0825, 2) AS CHAR),
-
     @batch_id, 'SALES_OLTP',
     o.order_seq * 10 + ln.n
 FROM tmp_order  o
 JOIN tmp_number ln
   ON ln.n BETWEEN 1 AND o.line_count
 JOIN tmp_product pr
-  -- Pareto skew: squaring a uniform [0,1) draw concentrates mass at low product
-  -- numbers, so a minority of SKUs carry most of the volume.
-  -- CAST to SIGNED matters: FLOOR() over POW() yields a DOUBLE, and comparing a
-  -- DOUBLE to the INT primary key blocks index lookup, turning 51,000 point
-  -- reads into 51,000 scans of tmp_product.
   ON pr.prod_num = 1 + CAST(FLOOR(
          POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
-         * 500) AS SIGNED);
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 0 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 20 DAY);  -- batch 1/55 (days 0-19)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 20 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 40 DAY);  -- batch 2/55 (days 20-39)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 40 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 60 DAY);  -- batch 3/55 (days 40-59)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 60 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 80 DAY);  -- batch 4/55 (days 60-79)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 80 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 100 DAY);  -- batch 5/55 (days 80-99)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 100 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 120 DAY);  -- batch 6/55 (days 100-119)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 120 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 140 DAY);  -- batch 7/55 (days 120-139)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 140 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 160 DAY);  -- batch 8/55 (days 140-159)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 160 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 180 DAY);  -- batch 9/55 (days 160-179)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 180 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 200 DAY);  -- batch 10/55 (days 180-199)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 200 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 220 DAY);  -- batch 11/55 (days 200-219)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 220 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 240 DAY);  -- batch 12/55 (days 220-239)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 240 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 260 DAY);  -- batch 13/55 (days 240-259)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 260 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 280 DAY);  -- batch 14/55 (days 260-279)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 280 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 300 DAY);  -- batch 15/55 (days 280-299)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 300 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 320 DAY);  -- batch 16/55 (days 300-319)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 320 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 340 DAY);  -- batch 17/55 (days 320-339)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 340 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 360 DAY);  -- batch 18/55 (days 340-359)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 360 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 380 DAY);  -- batch 19/55 (days 360-379)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 380 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 400 DAY);  -- batch 20/55 (days 380-399)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 400 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 420 DAY);  -- batch 21/55 (days 400-419)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 420 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 440 DAY);  -- batch 22/55 (days 420-439)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 440 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 460 DAY);  -- batch 23/55 (days 440-459)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 460 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 480 DAY);  -- batch 24/55 (days 460-479)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 480 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 500 DAY);  -- batch 25/55 (days 480-499)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 500 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 520 DAY);  -- batch 26/55 (days 500-519)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 520 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 540 DAY);  -- batch 27/55 (days 520-539)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 540 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 560 DAY);  -- batch 28/55 (days 540-559)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 560 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 580 DAY);  -- batch 29/55 (days 560-579)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 580 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 600 DAY);  -- batch 30/55 (days 580-599)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 600 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 620 DAY);  -- batch 31/55 (days 600-619)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 620 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 640 DAY);  -- batch 32/55 (days 620-639)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 640 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 660 DAY);  -- batch 33/55 (days 640-659)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 660 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 680 DAY);  -- batch 34/55 (days 660-679)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 680 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 700 DAY);  -- batch 35/55 (days 680-699)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 700 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 720 DAY);  -- batch 36/55 (days 700-719)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 720 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 740 DAY);  -- batch 37/55 (days 720-739)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 740 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 760 DAY);  -- batch 38/55 (days 740-759)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 760 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 780 DAY);  -- batch 39/55 (days 760-779)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 780 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 800 DAY);  -- batch 40/55 (days 780-799)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 800 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 820 DAY);  -- batch 41/55 (days 800-819)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 820 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 840 DAY);  -- batch 42/55 (days 820-839)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 840 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 860 DAY);  -- batch 43/55 (days 840-859)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 860 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 880 DAY);  -- batch 44/55 (days 860-879)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 880 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 900 DAY);  -- batch 45/55 (days 880-899)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 900 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 920 DAY);  -- batch 46/55 (days 900-919)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 920 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 940 DAY);  -- batch 47/55 (days 920-939)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 940 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 960 DAY);  -- batch 48/55 (days 940-959)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 960 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 980 DAY);  -- batch 49/55 (days 960-979)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 980 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 1000 DAY);  -- batch 50/55 (days 980-999)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 1000 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 1020 DAY);  -- batch 51/55 (days 1000-1019)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 1020 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 1040 DAY);  -- batch 52/55 (days 1020-1039)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 1040 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 1060 DAY);  -- batch 53/55 (days 1040-1059)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 1060 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 1080 DAY);  -- batch 54/55 (days 1060-1079)
+
+INSERT INTO staging.stg_sales_order_line (
+    order_number, order_line_number, ordered_at, shipped_date,
+    customer_id, store_id, channel_id, product_id, promotion_id,
+    order_status, payment_method, shipping_priority, is_gift,
+    quantity, unit_price, discount_amount, tax_amount,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    o.order_number,
+    CAST(ln.n AS CHAR),
+    CONCAT(DATE_FORMAT(o.order_date, '%Y-%m-%d'), ' ',
+           LPAD(8 + (CRC32(CONCAT('hr', o.order_number, ln.n)) % 13), 2, '0'), ':',
+           LPAD(CRC32(CONCAT('mi', o.order_number, ln.n)) % 60, 2, '0'), ':00'),
+    IFNULL(DATE_FORMAT(o.shipped_date, '%Y-%m-%d'), ''),
+    IF(CRC32(CONCAT('badcust', o.order_number, ln.n)) % 1000 = 13,
+       'C-99999', o.customer_id),
+    o.store_id,
+    o.channel_id,
+    IF(CRC32(CONCAT('badprod', o.order_number, ln.n)) % 250 = 7,
+       CONCAT('P-9', LPAD(CRC32(CONCAT('bp', o.order_number, ln.n)) % 900, 3, '0')),
+       CONCAT('P-', LPAD(pr.prod_num, 4, '0'))),
+    IF(o.promotion_id IS NOT NULL
+       AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+       o.promotion_id, ''),
+    o.order_status,
+    o.payment_method,
+    o.shipping_priority,
+    CAST(o.is_gift AS CHAR),
+    CASE
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 21 THEN 'N/A'
+        WHEN CRC32(CONCAT('badqty', o.order_number, ln.n)) % 1000 = 22 THEN '0'
+        ELSE CAST(
+            CASE
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                ELSE 6
+            END AS CHAR)
+    END,
+    CAST(ROUND(pr.list_price *
+        CASE
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 78 THEN 1.00
+            WHEN CRC32(CONCAT('mkdn', o.order_number, ln.n)) % 100 < 93 THEN 0.95
+            ELSE 0.90
+        END, 2) AS CHAR),
+    CAST(ROUND(
+        IF(o.promotion_id IS NOT NULL
+           AND CRC32(CONCAT('promo', o.order_number, ln.n)) % 100 < 45,
+           pr.list_price
+             * CASE
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+                   WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+                   ELSE 6
+               END
+             * IFNULL(o.promotion_pct, 0),
+           0), 2) AS CHAR),
+    CAST(ROUND(pr.list_price
+        * CASE
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 45 THEN 1
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 72 THEN 2
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 86 THEN 3
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 94 THEN 4
+              WHEN CRC32(CONCAT('qty', o.order_number, ln.n)) % 100 < 98 THEN 5
+              ELSE 6
+          END
+        * 0.0825, 2) AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    o.order_seq * 10 + ln.n
+FROM tmp_order  o
+JOIN tmp_number ln
+  ON ln.n BETWEEN 1 AND o.line_count
+JOIN tmp_product pr
+  ON pr.prod_num = 1 + CAST(FLOOR(
+         POW((CRC32(CONCAT('prod', o.order_number, ln.n)) % 1000) / 1000.0, 2)
+         * 500) AS SIGNED)
+WHERE o.order_date >= DATE_ADD(@sales_start, INTERVAL 1080 DAY)
+  AND o.order_date <  DATE_ADD(@sales_start, INTERVAL 1096 DAY);  -- batch 55/55 (days 1080-1095)
+
 
 -- DEFECT #12: 25 order lines delivered a second time, byte-identical.
 -- THE IDEMPOTENCY TEST. uq_fact_sales_natural on
@@ -1201,6 +9389,11 @@ LIMIT  25;
 --     because stockout-DAYS is an event count, not a repeated state.
 -- =============================================================================
 
+-- BATCHING: see Section 10's header for the full rationale (Error 2013 in
+-- MySQL Workbench). This section batches by p.prod_num instead of by date
+-- (inventory rows are not date-windowed the way orders are): 50 batches of
+-- 10 products each, 1-500 divides evenly with no remainder.
+
 INSERT INTO staging.stg_inventory (
     snapshot_date, product_id, store_id,
     quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
@@ -1212,46 +9405,1944 @@ SELECT
                  INTERVAL dy.n DAY), '%Y-%m-%d'),
     p.product_id,
     s.store_id,
-
-    -- DEFECT #13: ~20 rows report negative stock — physically impossible, and
-    -- exactly what ck_fact_inventory_quantities exists to reject.
     CASE
         WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
             THEN '-5'
         ELSE CAST(
             GREATEST(0,
-                -- Opening position, 20-199 units.
                 (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
-                -- ~25% of pairs are flat (drift 0); the rest bleed down 0-9
-                -- units a day, some reaching zero.
                 - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
                             0,
                             CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
-                -- Replenishment lands mid-window for about half the pairs.
                 + IF(dy.n >= 10
                      AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
                      60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
                      0)
             ) AS CHAR)
     END,
-
     CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
             10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
             0) AS CHAR),
     CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
-    -- Cost travels with the snapshot so the warehouse can value the position
-    -- AS AT that day. Looking it up later would value old stock at today's cost
-    -- and quietly restate inventory history.
     CAST(p.unit_cost AS CHAR),
-
     @batch_id, 'SALES_OLTP',
     (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
 FROM       tmp_product p
 CROSS JOIN tmp_store   s
 CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
--- Each store stocks a deterministic ~16% of the catalogue: 500 x 0.16 = ~80
--- products, x 25 stores x 20 days ~= 40,000 rows.
-WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16;
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 1 AND 10;  -- batch 1/50 (products 1-10)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 11 AND 20;  -- batch 2/50 (products 11-20)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 21 AND 30;  -- batch 3/50 (products 21-30)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 31 AND 40;  -- batch 4/50 (products 31-40)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 41 AND 50;  -- batch 5/50 (products 41-50)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 51 AND 60;  -- batch 6/50 (products 51-60)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 61 AND 70;  -- batch 7/50 (products 61-70)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 71 AND 80;  -- batch 8/50 (products 71-80)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 81 AND 90;  -- batch 9/50 (products 81-90)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 91 AND 100;  -- batch 10/50 (products 91-100)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 101 AND 110;  -- batch 11/50 (products 101-110)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 111 AND 120;  -- batch 12/50 (products 111-120)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 121 AND 130;  -- batch 13/50 (products 121-130)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 131 AND 140;  -- batch 14/50 (products 131-140)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 141 AND 150;  -- batch 15/50 (products 141-150)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 151 AND 160;  -- batch 16/50 (products 151-160)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 161 AND 170;  -- batch 17/50 (products 161-170)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 171 AND 180;  -- batch 18/50 (products 171-180)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 181 AND 190;  -- batch 19/50 (products 181-190)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 191 AND 200;  -- batch 20/50 (products 191-200)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 201 AND 210;  -- batch 21/50 (products 201-210)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 211 AND 220;  -- batch 22/50 (products 211-220)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 221 AND 230;  -- batch 23/50 (products 221-230)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 231 AND 240;  -- batch 24/50 (products 231-240)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 241 AND 250;  -- batch 25/50 (products 241-250)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 251 AND 260;  -- batch 26/50 (products 251-260)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 261 AND 270;  -- batch 27/50 (products 261-270)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 271 AND 280;  -- batch 28/50 (products 271-280)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 281 AND 290;  -- batch 29/50 (products 281-290)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 291 AND 300;  -- batch 30/50 (products 291-300)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 301 AND 310;  -- batch 31/50 (products 301-310)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 311 AND 320;  -- batch 32/50 (products 311-320)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 321 AND 330;  -- batch 33/50 (products 321-330)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 331 AND 340;  -- batch 34/50 (products 331-340)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 341 AND 350;  -- batch 35/50 (products 341-350)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 351 AND 360;  -- batch 36/50 (products 351-360)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 361 AND 370;  -- batch 37/50 (products 361-370)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 371 AND 380;  -- batch 38/50 (products 371-380)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 381 AND 390;  -- batch 39/50 (products 381-390)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 391 AND 400;  -- batch 40/50 (products 391-400)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 401 AND 410;  -- batch 41/50 (products 401-410)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 411 AND 420;  -- batch 42/50 (products 411-420)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 421 AND 430;  -- batch 43/50 (products 421-430)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 431 AND 440;  -- batch 44/50 (products 431-440)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 441 AND 450;  -- batch 45/50 (products 441-450)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 451 AND 460;  -- batch 46/50 (products 451-460)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 461 AND 470;  -- batch 47/50 (products 461-470)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 471 AND 480;  -- batch 48/50 (products 471-480)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 481 AND 490;  -- batch 49/50 (products 481-490)
+
+INSERT INTO staging.stg_inventory (
+    snapshot_date, product_id, store_id,
+    quantity_on_hand, quantity_on_order, reorder_point, unit_cost,
+    _load_batch_id, _source_system, _source_row_num
+)
+SELECT
+    DATE_FORMAT(
+        DATE_ADD(DATE_ADD(@sales_start, INTERVAL (@sales_days - 20) DAY),
+                 INTERVAL dy.n DAY), '%Y-%m-%d'),
+    p.product_id,
+    s.store_id,
+    CASE
+        WHEN CRC32(CONCAT('negstock', p.prod_num, s.store_num, dy.n)) % 2000 = 5
+            THEN '-5'
+        ELSE CAST(
+            GREATEST(0,
+                (20 + CRC32(CONCAT('stock', p.prod_num, s.store_num)) % 180)
+                - dy.n * IF(CRC32(CONCAT('flat', p.prod_num, s.store_num)) % 100 < 25,
+                            0,
+                            CRC32(CONCAT('drift', p.prod_num, s.store_num)) % 10)
+                + IF(dy.n >= 10
+                     AND CRC32(CONCAT('repl', p.prod_num, s.store_num)) % 100 < 50,
+                     60 + CRC32(CONCAT('replqty', p.prod_num, s.store_num)) % 90,
+                     0)
+            ) AS CHAR)
+    END,
+    CAST(IF(CRC32(CONCAT('onord', p.prod_num, s.store_num, dy.n)) % 100 < 30,
+            10 + CRC32(CONCAT('oqty', p.prod_num, s.store_num, dy.n)) % 90,
+            0) AS CHAR),
+    CAST(10 + CRC32(CONCAT('reord', p.prod_num, s.store_num)) % 40 AS CHAR),
+    CAST(p.unit_cost AS CHAR),
+    @batch_id, 'SALES_OLTP',
+    (dy.n * 100000) + (s.store_num * 1000) + p.prod_num
+FROM       tmp_product p
+CROSS JOIN tmp_store   s
+CROSS JOIN (SELECT n FROM tmp_number WHERE n BETWEEN 0 AND 19) dy
+WHERE CRC32(CONCAT('stocks', s.store_num, '-', p.prod_num)) % 100 < 16
+  AND p.prod_num BETWEEN 491 AND 500;  -- batch 50/50 (products 491-500)
 
 
 -- =============================================================================
